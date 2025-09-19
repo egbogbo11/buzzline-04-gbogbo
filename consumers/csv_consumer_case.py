@@ -1,7 +1,7 @@
 """
 csv_consumer_case.py
 
-Consume json messages from a Kafka topic and visualize author counts in real-time.
+Consume json messages from a Kafka topic and visualize temperature data in real-time.
 
 Example Kafka message format:
 {"timestamp": "2025-01-11T18:15:00Z", "temperature": 225.0}
@@ -15,6 +15,8 @@ Example Kafka message format:
 # Import packages from Python Standard Library
 import os
 import json  # handle JSON parsing
+import time
+from datetime import datetime
 
 # Use a deque ("deck") - a double-ended queue data structure
 # A deque is a good way to monitor a certain number of "most recent" messages
@@ -23,12 +25,15 @@ from collections import deque
 
 # Import external packages
 from dotenv import load_dotenv
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError, KafkaTimeoutError
 
 # IMPORTANT
 # Import Matplotlib.pyplot for live plotting
 # Use the common alias 'plt' for Matplotlib.pyplot
 # Know pyplot well
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # Import functions from local modules
 from utils.utils_consumer import create_kafka_consumer
@@ -59,6 +64,13 @@ def get_kafka_consumer_group_id() -> str:
     return group_id
 
 
+def get_kafka_broker_address() -> str:
+    """Fetch Kafka broker address from environment or use default."""
+    broker = os.getenv("KAFKA_BROKER_ADDRESS", "localhost:9092")
+    logger.info(f"Kafka broker address: {broker}")
+    return broker
+
+
 def get_stall_threshold() -> float:
     """Fetch message interval from environment or use default."""
     temp_variation = float(os.getenv("SMOKER_STALL_THRESHOLD_F", 0.2))
@@ -70,6 +82,80 @@ def get_rolling_window_size() -> int:
     window_size = int(os.getenv("SMOKER_ROLLING_WINDOW_SIZE", 5))
     logger.info(f"Rolling window size: {window_size}")
     return window_size
+
+
+def get_processing_delay() -> float:
+    """Fetch processing delay from environment or use default."""
+    delay = float(os.getenv("MESSAGE_PROCESSING_DELAY", "2.0"))
+    logger.info(f"Message processing delay: {delay} seconds")
+    return delay
+
+
+#####################################
+# Alternative Consumer Creation Function
+#####################################
+
+
+def create_robust_kafka_consumer(topic: str, group_id: str) -> KafkaConsumer:
+    """
+    Create a robust Kafka consumer with fallback configurations.
+    
+    Args:
+        topic (str): The Kafka topic to consume from
+        group_id (str): The consumer group ID
+        
+    Returns:
+        KafkaConsumer: Configured Kafka consumer instance
+    """
+    broker = get_kafka_broker_address()
+    
+    # Try different configurations
+    configs_to_try = [
+        # Configuration 1: Minimal and robust
+        {
+            'bootstrap_servers': [broker],
+            'group_id': group_id,
+            'auto_offset_reset': 'latest',
+            'enable_auto_commit': True,
+            'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+            'consumer_timeout_ms': 1000,
+            'request_timeout_ms': 30000,
+            'session_timeout_ms': 10000,
+            'heartbeat_interval_ms': 3000,
+        },
+        # Configuration 2: With explicit API version
+        {
+            'bootstrap_servers': [broker],
+            'group_id': group_id,
+            'auto_offset_reset': 'latest',
+            'enable_auto_commit': True,
+            'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+            'api_version': (0, 10, 1),
+            'consumer_timeout_ms': 1000,
+        },
+        # Configuration 3: Very basic
+        {
+            'bootstrap_servers': [broker],
+            'group_id': group_id,
+            'auto_offset_reset': 'latest',
+            'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+        }
+    ]
+    
+    for i, config in enumerate(configs_to_try, 1):
+        try:
+            logger.info(f"Trying consumer configuration {i}...")
+            consumer = KafkaConsumer(**config)
+            consumer.subscribe([topic])
+            logger.info(f"Consumer created successfully with configuration {i}")
+            return consumer
+        except Exception as e:
+            logger.warning(f"Configuration {i} failed: {e}")
+            if i < len(configs_to_try):
+                logger.info(f"Trying next configuration...")
+            continue
+    
+    raise Exception("All consumer configurations failed")
 
 
 #####################################
@@ -87,7 +173,7 @@ temperatures = []  # To store temperature readings for the y-axis
 # two objects at once:
 # - a figure (which can have many axis)
 # - an axis (what they call a chart in Matplotlib)
-fig, ax = plt.subplots()
+fig, ax = plt.subplots(figsize=(12, 8))
 
 # Use the ion() method (stands for "interactive on")
 # to turn on interactive mode for live updates
@@ -141,73 +227,100 @@ def update_chart(rolling_window, window_size):
         rolling_window (deque): Rolling window of temperature readings.
         window_size (int): Size of the rolling window.
     """
-    # Clear the previous chart
-    ax.clear()  
+    try:
+        # Clear the previous chart
+        ax.clear()  
 
-    # Create a line chart using the plot() method
-    # Use the timestamps for the x-axis and temperatures for the y-axis
-    # Use the label parameter to add a legend entry
-    # Use the color parameter to set the line color
-    ax.plot(timestamps, temperatures, label="Temperature", color="blue")
+        if not timestamps or not temperatures:
+            logger.debug("No data to plot yet")
+            return
 
-    # Use the built-in axes methods to set the labels and title
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Temperature (°F)")
-    ax.set_title("Smart Smoker: Temperature vs. Time")
+        # Convert timestamp strings to datetime objects for better plotting
+        datetime_timestamps = []
+        for ts in timestamps:
+            try:
+                if isinstance(ts, str):
+                    # Handle ISO format timestamps
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    datetime_timestamps.append(dt)
+                else:
+                    # If it's already a datetime or number, use as is
+                    datetime_timestamps.append(ts)
+            except (ValueError, AttributeError):
+                # If timestamp parsing fails, use string as is
+                datetime_timestamps.append(ts)
 
-    # Highlight stall points if conditions are met such that
-    #    The rolling window is full and a stall is detected
-    if len(rolling_window) >= window_size and detect_stall(rolling_window, window_size):
-        # Mark the stall point on the chart
+        # Create a line chart using the plot() method
+        # Use the timestamps for the x-axis and temperatures for the y-axis
+        # Use the label parameter to add a legend entry
+        # Use the color parameter to set the line color
+        ax.plot(datetime_timestamps, temperatures, label="Temperature", color="blue", linewidth=2)
 
-        # An index of -1 gets the last element in a list
-        stall_time = timestamps[-1]
-        stall_temp = temperatures[-1]
+        # Use the built-in axes methods to set the labels and title
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Temperature (°F)")
+        ax.set_title("Smart Smoker: Temperature vs. Time - Elom Gbogbo")
 
-        # Use the scatter() method to plot a point
-        # Pass in the x value as a list, the y value as a list (using [])
-        # and set the marker color and label
-        # zorder is used to ensure the point is plotted on TOP of the line chart
-        # zorder of 5 is higher than the default zorder of 2
-        ax.scatter(
-            [stall_time], [stall_temp], color="red", label="Stall Detected", zorder=5
-        )
+        # Highlight stall points if conditions are met such that
+        #    The rolling window is full and a stall is detected
+        if len(rolling_window) >= window_size and detect_stall(rolling_window, window_size):
+            # Mark the stall point on the chart
 
-        # Use the annotate() method to add a text label
-        # To learn more, look up the matplotlib axes.annotate documentation
-        # https://matplotlib.org/stable/api/_as_gen/matplotlib.axes.Axes.annotate.html
-        # textcoords="offset points" means the label is placed relative to the point
-        # xytext=(10, -10) means the label is placed 10 points to the right and 10 points down from the point 
-        # Typically, the first number is x (horizontal) and the second is y (vertical)
-        # x: Positive moves to the right, negative to the left
-        # y: Positive moves up, negative moves down
-        # ha stands for horizontal alignment
-        # We set color to red, a common convention for warnings
-        ax.annotate(
-            "Stall Detected",
-            (stall_time, stall_temp),
-            textcoords="offset points",
-            xytext=(10, -10),
-            ha="center",
-            color="red",
-        )
+            # An index of -1 gets the last element in a list
+            stall_time = datetime_timestamps[-1]
+            stall_temp = temperatures[-1]
 
-    # Regardless of whether a stall is detected, we want to show the legend
+            # Use the scatter() method to plot a point
+            # Pass in the x value as a list, the y value as a list (using [])
+            # and set the marker color and label
+            # zorder is used to ensure the point is plotted on TOP of the line chart
+            # zorder of 5 is higher than the default zorder of 2
+            ax.scatter(
+                [stall_time], [stall_temp], color="red", s=100, label="Stall Detected", zorder=5
+            )
 
-    # Use the legend() method to display the legend
-    ax.legend()
+            # Use the annotate() method to add a text label
+            # To learn more, look up the matplotlib axes.annotate documentation
+            # https://matplotlib.org/stable/api/_as_gen/matplotlib.axes.Axes.annotate.html
+            # textcoords="offset points" means the label is placed relative to the point
+            # xytext=(10, -10) means the label is placed 10 points to the right and 10 points down from the point 
+            # Typically, the first number is x (horizontal) and the second is y (vertical)
+            # x: Positive moves to the right, negative to the left
+            # y: Positive moves up, negative moves down
+            # ha stands for horizontal alignment
+            # We set color to red, a common convention for warnings
+            ax.annotate(
+                "Stall Detected",
+                (stall_time, stall_temp),
+                textcoords="offset points",
+                xytext=(10, -10),
+                ha="center",
+                color="red",
+                fontweight='bold',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7)
+            )
 
-    # Use the autofmt_xdate() method to automatically format the x-axis labels as dates
-    fig.autofmt_xdate()
+        # Regardless of whether a stall is detected, we want to show the legend
+        # Use the legend() method to display the legend
+        ax.legend()
 
-    # Use the tight_layout() method to automatically adjust the padding
-    plt.tight_layout()
+        # Format x-axis for better date/time display
+        if datetime_timestamps and isinstance(datetime_timestamps[0], datetime):
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+            ax.xaxis.set_major_locator(mdates.SecondLocator(interval=30))
+            fig.autofmt_xdate()
 
-    # Draw the chart
-    plt.draw()
+        # Use the tight_layout() method to automatically adjust the padding
+        plt.tight_layout()
 
-    # Pause briefly to allow some time for the chart to render
-    plt.pause(0.01)  
+        # Draw the chart
+        plt.draw()
+
+        # Pause longer to slow down chart updates
+        plt.pause(0.5)  # Increased from 0.01 to 0.5 seconds
+        
+    except Exception as e:
+        logger.warning(f"Error updating chart: {e}")
 
 
 #####################################
@@ -239,6 +352,13 @@ def process_message(message: str, rolling_window: deque, window_size: int) -> No
             logger.error(f"Invalid message format: {message}")
             return
 
+        # Convert temperature to float if it's not already
+        try:
+            temperature = float(temperature)
+        except (ValueError, TypeError):
+            logger.error(f"Invalid temperature value: {temperature}")
+            return
+
         # Append the temperature reading to the rolling window
         rolling_window.append(temperature)
 
@@ -262,17 +382,85 @@ def process_message(message: str, rolling_window: deque, window_size: int) -> No
 
 
 #####################################
+# Enhanced polling function
+#####################################
+
+
+def poll_messages_robust(consumer: KafkaConsumer, topic: str, rolling_window: deque, window_size: int) -> None:
+    """
+    Poll messages from Kafka with robust error handling.
+    
+    Args:
+        consumer (KafkaConsumer): The Kafka consumer instance
+        topic (str): The topic name for logging
+        rolling_window (deque): Rolling window for temperature readings
+        window_size (int): Size of the rolling window
+    """
+    logger.info(f"Starting robust message polling from topic '{topic}'...")
+    
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    processing_delay = get_processing_delay()
+    
+    while True:
+        try:
+            # Poll for messages with longer timeout and fewer records for slower processing
+            message_batch = consumer.poll(timeout_ms=3000, max_records=3)
+            
+            if message_batch:
+                consecutive_errors = 0  # Reset error count on success
+                
+                for topic_partition, messages in message_batch.items():
+                    logger.debug(f"Received {len(messages)} messages from {topic_partition}")
+                    for message in messages:
+                        message_str = message.value
+                        logger.debug(f"Processing message at offset {message.offset}")
+                        process_message(message_str, rolling_window, window_size)
+                        
+                        # Add delay after processing each message
+                        time.sleep(processing_delay)
+            else:
+                # No messages received, this is normal
+                logger.debug("No messages received in this poll cycle")
+                time.sleep(2.0)  # Wait 2 seconds before next poll
+                
+        except KafkaTimeoutError:
+            logger.debug("Poll timeout - this is normal, continuing...")
+            continue
+            
+        except KafkaError as e:
+            consecutive_errors += 1
+            logger.error(f"Kafka error during polling (#{consecutive_errors}): {e}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping consumer.")
+                break
+                
+            time.sleep(1)  # Wait before retrying
+            
+        except KeyboardInterrupt:
+            logger.warning("Consumer interrupted by user (Ctrl+C)")
+            break
+            
+        except Exception as e:
+            consecutive_errors += 1
+            logger.error(f"Unexpected error during polling (#{consecutive_errors}): {e}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping consumer.")
+                break
+                
+            time.sleep(1)  # Wait before retrying
+
+
+#####################################
 # Define main function for this module
 #####################################
 
 
 def main() -> None:
     """
-    Main entry point for the consumer.
-
-    - Reads the Kafka topic name and consumer group ID from environment variables.
-    - Creates a Kafka consumer using the `create_kafka_consumer` utility.
-    - Polls messages and updates a live chart.
+    Main entry point for the consumer with enhanced error handling.
     """
     logger.info("START consumer.")
 
@@ -288,23 +476,33 @@ def main() -> None:
     logger.info(f"Rolling window size: {window_size}")
     rolling_window = deque(maxlen=window_size)
 
-    # Create the Kafka consumer using the helpful utility function.
-    consumer = create_kafka_consumer(topic, group_id)
-
-    # Poll and process messages
-    logger.info(f"Polling messages from topic '{topic}'...")
+    consumer = None
     try:
-        for message in consumer:
-            message_str = message.value
-            logger.debug(f"Received message at offset {message.offset}: {message_str}")
-            process_message(message_str, rolling_window, window_size)
-    except KeyboardInterrupt:
-        logger.warning("Consumer interrupted by user.")
+        # Try the original consumer creation first
+        try:
+            logger.info("Attempting to create consumer using utils_consumer...")
+            consumer = create_kafka_consumer(topic, group_id)
+        except Exception as e:
+            logger.warning(f"Original consumer creation failed: {e}")
+            logger.info("Trying robust consumer creation...")
+            consumer = create_robust_kafka_consumer(topic, group_id)
+
+        # Start polling with robust error handling
+        poll_messages_robust(consumer, topic, rolling_window, window_size)
+        
     except Exception as e:
-        logger.error(f"Error while consuming messages: {e}")
+        logger.error(f"Fatal error in consumer: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        consumer.close()
-        logger.info(f"Kafka consumer for topic '{topic}' closed.")
+        if consumer:
+            try:
+                consumer.close()
+                logger.info(f"Kafka consumer for topic '{topic}' closed.")
+            except Exception as e:
+                logger.warning(f"Error closing consumer: {e}")
+
+    logger.info(f"END consumer for topic '{topic}' and group '{group_id}'.")
 
 
 #####################################
