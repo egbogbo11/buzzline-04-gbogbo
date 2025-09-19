@@ -20,10 +20,13 @@ Example JSON message (after deserialization) to be analyzed
 # Import packages from Python Standard Library
 import os
 import json  # handle JSON parsing
+import time
 from collections import defaultdict  # data structure for counting author occurrences
 
 # Import external packages
 from dotenv import load_dotenv
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError, KafkaTimeoutError
 
 # IMPORTANT
 # Import Matplotlib.pyplot for live plotting
@@ -60,6 +63,80 @@ def get_kafka_consumer_group_id() -> str:
     return group_id
 
 
+def get_kafka_broker_address() -> str:
+    """Fetch Kafka broker address from environment or use default."""
+    broker = os.getenv("KAFKA_BROKER_ADDRESS", "localhost:9092")
+    logger.info(f"Kafka broker address: {broker}")
+    return broker
+
+
+#####################################
+# Alternative Consumer Creation Function
+#####################################
+
+
+def create_robust_kafka_consumer(topic: str, group_id: str) -> KafkaConsumer:
+    """
+    Create a robust Kafka consumer with fallback configurations.
+    
+    Args:
+        topic (str): The Kafka topic to consume from
+        group_id (str): The consumer group ID
+        
+    Returns:
+        KafkaConsumer: Configured Kafka consumer instance
+    """
+    broker = get_kafka_broker_address()
+    
+    # Try different configurations
+    configs_to_try = [
+        # Configuration 1: Minimal and robust
+        {
+            'bootstrap_servers': [broker],
+            'group_id': group_id,
+            'auto_offset_reset': 'latest',
+            'enable_auto_commit': True,
+            'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+            'consumer_timeout_ms': 1000,
+            'request_timeout_ms': 30000,
+            'session_timeout_ms': 10000,
+            'heartbeat_interval_ms': 3000,
+        },
+        # Configuration 2: With explicit API version
+        {
+            'bootstrap_servers': [broker],
+            'group_id': group_id,
+            'auto_offset_reset': 'latest',
+            'enable_auto_commit': True,
+            'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+            'api_version': (0, 10, 1),
+            'consumer_timeout_ms': 1000,
+        },
+        # Configuration 3: Very basic
+        {
+            'bootstrap_servers': [broker],
+            'group_id': group_id,
+            'auto_offset_reset': 'latest',
+            'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+        }
+    ]
+    
+    for i, config in enumerate(configs_to_try, 1):
+        try:
+            logger.info(f"Trying consumer configuration {i}...")
+            consumer = KafkaConsumer(**config)
+            consumer.subscribe([topic])
+            logger.info(f"Consumer created successfully with configuration {i}")
+            return consumer
+        except Exception as e:
+            logger.warning(f"Configuration {i} failed: {e}")
+            if i < len(configs_to_try):
+                logger.info(f"Trying next configuration...")
+            continue
+    
+    raise Exception("All consumer configurations failed")
+
+
 #####################################
 # Set up data structures
 #####################################
@@ -89,36 +166,40 @@ plt.ion()
 
 def update_chart():
     """Update the live chart with the latest author counts."""
-    # Clear the previous chart
-    ax.clear()
+    try:
+        # Clear the previous chart
+        ax.clear()
 
-    # Get the authors and counts from the dictionary
-    authors_list = list(author_counts.keys())
-    counts_list = list(author_counts.values())
+        # Get the authors and counts from the dictionary
+        authors_list = list(author_counts.keys())
+        counts_list = list(author_counts.values())
 
-    # Create a bar chart using the bar() method.
-    # Pass in the x list, the y list, and the color
-    ax.bar(authors_list, counts_list, color="skyblue")
+        # Create a bar chart using the bar() method.
+        # Pass in the x list, the y list, and the color
+        ax.bar(authors_list, counts_list, color="skyblue")
 
-    # Use the built-in axes methods to set the labels and title
-    ax.set_xlabel("Authors")
-    ax.set_ylabel("Message Counts")
-    ax.set_title("Real-Time Author Message Counts")
+        # Use the built-in axes methods to set the labels and title
+        ax.set_xlabel("Authors")
+        ax.set_ylabel("Message Counts")
+        ax.set_title("Real-Time Author Message Counts - Elom Gbogbo")
 
-    # Use the set_xticklabels() method to rotate the x-axis labels
-    # Pass in the x list, specify the rotation angle is 45 degrees,
-    # and align them to the right
-    # ha stands for horizontal alignment
-    ax.set_xticklabels(authors_list, rotation=45, ha="right")
+        # Use the set_xticklabels() method to rotate the x-axis labels
+        # Pass in the x list, specify the rotation angle is 45 degrees,
+        # and align them to the right
+        # ha stands for horizontal alignment
+        if authors_list:  # Only set labels if there are authors
+            ax.set_xticklabels(authors_list, rotation=45, ha="right")
 
-    # Use the tight_layout() method to automatically adjust the padding
-    plt.tight_layout()
+        # Use the tight_layout() method to automatically adjust the padding
+        plt.tight_layout()
 
-    # Draw the chart
-    plt.draw()
+        # Draw the chart
+        plt.draw()
 
-    # Pause briefly to allow some time for the chart to render
-    plt.pause(0.01)
+        # Pause briefly to allow some time for the chart to render
+        plt.pause(0.01)
+    except Exception as e:
+        logger.warning(f"Error updating chart: {e}")
 
 
 #####################################
@@ -170,17 +251,80 @@ def process_message(message: str) -> None:
 
 
 #####################################
+# Enhanced polling function
+#####################################
+
+
+def poll_messages_robust(consumer: KafkaConsumer, topic: str) -> None:
+    """
+    Poll messages from Kafka with robust error handling.
+    
+    Args:
+        consumer (KafkaConsumer): The Kafka consumer instance
+        topic (str): The topic name for logging
+    """
+    logger.info(f"Starting robust message polling from topic '{topic}'...")
+    
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
+    while True:
+        try:
+            # Poll for messages with timeout
+            message_batch = consumer.poll(timeout_ms=1000, max_records=10)
+            
+            if message_batch:
+                consecutive_errors = 0  # Reset error count on success
+                
+                for topic_partition, messages in message_batch.items():
+                    logger.debug(f"Received {len(messages)} messages from {topic_partition}")
+                    for message in messages:
+                        message_str = message.value
+                        logger.debug(f"Processing message at offset {message.offset}")
+                        process_message(message_str)
+                        time.sleep(1.0)  # Add 1 second delay after each message
+            else:
+                # No messages received, this is normal
+                logger.debug("No messages received in this poll cycle")
+                time.sleep(2.0)  # Increased delay - poll every 2 seconds
+                
+        except KafkaTimeoutError:
+            logger.debug("Poll timeout - this is normal, continuing...")
+            continue
+            
+        except KafkaError as e:
+            consecutive_errors += 1
+            logger.error(f"Kafka error during polling (#{consecutive_errors}): {e}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping consumer.")
+                break
+                
+            time.sleep(1)  # Wait before retrying
+            
+        except KeyboardInterrupt:
+            logger.warning("Consumer interrupted by user (Ctrl+C)")
+            break
+            
+        except Exception as e:
+            consecutive_errors += 1
+            logger.error(f"Unexpected error during polling (#{consecutive_errors}): {e}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping consumer.")
+                break
+                
+            time.sleep(1)  # Wait before retrying
+
+
+#####################################
 # Define main function for this module
 #####################################
 
 
 def main() -> None:
     """
-    Main entry point for the consumer.
-
-    - Reads the Kafka topic name and consumer group ID from environment variables.
-    - Creates a Kafka consumer using the `create_kafka_consumer` utility.
-    - Polls messages and updates a live chart.
+    Main entry point for the consumer with enhanced error handling.
     """
     logger.info("START consumer.")
 
@@ -189,25 +333,31 @@ def main() -> None:
     group_id = get_kafka_consumer_group_id()
     logger.info(f"Consumer: Topic '{topic}' and group '{group_id}'...")
 
-    # Create the Kafka consumer using the helpful utility function.
-    consumer = create_kafka_consumer(topic, group_id)
-
-    # Poll and process messages
-    logger.info(f"Polling messages from topic '{topic}'...")
+    consumer = None
     try:
-        for message in consumer:
-            # message is a complex object with metadata and value
-            # Use the value attribute to extract the message as a string
-            message_str = message.value
-            logger.debug(f"Received message at offset {message.offset}: {message_str}")
-            process_message(message_str)
-    except KeyboardInterrupt:
-        logger.warning("Consumer interrupted by user.")
+        # Try the original consumer creation first
+        try:
+            logger.info("Attempting to create consumer using utils_consumer...")
+            consumer = create_kafka_consumer(topic, group_id)
+        except Exception as e:
+            logger.warning(f"Original consumer creation failed: {e}")
+            logger.info("Trying robust consumer creation...")
+            consumer = create_robust_kafka_consumer(topic, group_id)
+
+        # Start polling with robust error handling
+        poll_messages_robust(consumer, topic)
+        
     except Exception as e:
-        logger.error(f"Error while consuming messages: {e}")
+        logger.error(f"Fatal error in consumer: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        consumer.close()
-        logger.info(f"Kafka consumer for topic '{topic}' closed.")
+        if consumer:
+            try:
+                consumer.close()
+                logger.info(f"Kafka consumer for topic '{topic}' closed.")
+            except Exception as e:
+                logger.warning(f"Error closing consumer: {e}")
 
     logger.info(f"END consumer for topic '{topic}' and group '{group_id}'.")
 
@@ -217,7 +367,6 @@ def main() -> None:
 #####################################
 
 if __name__ == "__main__":
-
     # Call the main function to start the consumer
     main()
 
