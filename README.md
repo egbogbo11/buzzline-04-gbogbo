@@ -290,3 +290,64 @@ Live Bar Chart (Kafka JSON streaming)
 Live Line Chart with Alert (Kafka CSV streaming)
 
 ![CSV (Kafka)](images/live_line_chart_example.jpg)
+
+## My Custom Consumer: Category Distribution Analysis
+
+### What It Does
+My consumer (`project_consumer_gbogbo.py`) analyzes the **distribution of message categories** in real-time. It tracks which types of content (humor, news, sports, etc.) are being posted most frequently and displays this information in a live, colorful bar chart.
+
+### Insight Focus
+**Message Categories Distribution** - Understanding what types of content are most popular in real-time social media streams. This provides valuable insights into:
+- Which content categories dominate the conversation
+- How content preferences change over time
+- Real-time audience engagement patterns by content type
+
+### Visualization Type
+**Animated Bar Chart with Color Coding** - This chart type is particularly interesting because:
+- **Easy Comparison**: Bar heights make it simple to compare category popularity at a glance
+- **Color Differentiation**: Each category gets a unique color for instant visual recognition
+- **Real-time Updates**: Bars grow dynamically as new messages arrive, showing live trends
+- **Statistical Display**: Shows exact counts on each bar plus total messages and most popular category
+- **Professional Presentation**: Clean, business-ready visualization with grid lines and proper labeling
+
+The bar chart format is ideal for categorical data comparison and makes trends immediately obvious to viewers.
+
+### JSON Message Format
+
+The system processes JSON messages in this format:
+```json
+{
+    "message": "I just shared a meme! It was amazing.",
+    "author": "Charlie",
+    "timestamp": "2025-01-29 14:35:20",
+    "category": "humor",
+    "sentiment": 0.87,
+    "keyword_mentioned": "meme",
+    "message_length": 42
+}
+```
+#### Producer Terminal for Custom Consumer
+
+Start the **required project producer** (DO NOT MODIFY this file):
+```shell
+.venv\Scripts\activate
+py project_producer_case.py
+```
+
+My Custom Consumer Terminal
+Start my category distribution consumer in a NEW terminal:
+```shell
+.venv\Scripts\activate
+py consumers/project_consumer_gbogbo.py
+```
+
+#### What You'll See
+
+- **Live bar chart** showing message categories (humor, news, sports, etc.)
+- **Color-coded bars** - each category gets its own color
+- **Real-time updates** as new messages arrive
+- **Count labels** on each bar showing exact numbers
+- **Statistics in title** - total messages and most popular category
+- **Final summary** when you stop (Ctrl+C) with percentages by category
+
+When done, remember to kill both terminals (producer and consumer).
